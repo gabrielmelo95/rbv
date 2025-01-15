@@ -1,4 +1,5 @@
 #folders
+/managed_components
 /.devcontainer
 /.vscode
 /build
