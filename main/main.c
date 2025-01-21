@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <sys/unistd.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,9 +22,12 @@
 #include "soc/gpio_struct.h"
 #include "driver/gpio.h"
 #include "esp_dsp.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 
 const char *TAG = "[MAIN]";
 
+/* I2S defs */
 #define EXAMPLE_STD_BCLK_IO1 GPIO_NUM_0 // I2S bit clock io number
 #define EXAMPLE_STD_WS_IO1 GPIO_NUM_1   // I2S word select io number
 #define EXAMPLE_STD_DOUT_IO1 GPIO_NUM_2 // I2S data out io number
@@ -34,6 +39,14 @@ const char *TAG = "[MAIN]";
 #define GPIO_INPUT_PIN_SEL (1ULL << GPIO_NUM_21)
 #define I2S_BUFFER_32_TOTAL_SIZE I2S_SAMPLE_RATE
 #define I2S_BUFFER_16_TOTAL_SIZE I2S_SAMPLE_RATE >> 2
+
+/* SPI defs */
+#define EXAMPLE_MAX_CHAR_SIZE 64
+#define MOUNT_POINT "/sdcard"
+#define PIN_NUM_MISO GPIO_NUM_17
+#define PIN_NUM_MOSI GPIO_NUM_16
+#define PIN_NUM_CLK GPIO_NUM_23
+#define PIN_NUM_CS GPIO_NUM_22
 
 uint8_t buffer32[I2S_BUFFER_32_TOTAL_SIZE] = {0};
 int16_t buffer16[I2S_BUFFER_16_TOTAL_SIZE] = {0};
@@ -167,12 +180,124 @@ void gpio_config_pin(void)
     gpio_config(&io_conf);
 }
 
+static esp_err_t sd_write_file(const char *path, char *data)
+{
+    ESP_LOGI(TAG, "Opening file %s", path);
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return ESP_FAIL;
+    }
+    fprintf(f, data);
+    fclose(f);
+    ESP_LOGI(TAG, "File written");
+
+    return ESP_OK;
+}
+
+static esp_err_t sd_read_file(const char *path)
+{
+    ESP_LOGI(TAG, "Reading file %s", path);
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return ESP_FAIL;
+    }
+    char line[EXAMPLE_MAX_CHAR_SIZE];
+    fgets(line, sizeof(line), f);
+    fclose(f);
+
+    // strip newline
+    char *pos = strchr(line, '\n');
+    if (pos)
+    {
+        *pos = '\0';
+    }
+    ESP_LOGI(TAG, "Read from file: '%s'", line);
+
+    return ESP_OK;
+}
+
+esp_err_t sd_card_init(void)
+{
+    esp_err_t ret;
+
+    // Options for mounting the filesystem.
+    // If format_if_mount_failed is set to true, SD card will be partitioned and
+    // formatted in case when mounting fails.
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024};
+    sdmmc_card_t *card;
+    const char mount_point[] = MOUNT_POINT;
+    ESP_LOGI(TAG, "Initializing SD card");
+
+    // Use settings defined above to initialize SD card and mount FAT filesystem.
+    // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
+    // Please check its source code and implement error recovery when developing
+    // production applications.
+    ESP_LOGI(TAG, "Using SPI peripheral");
+
+    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
+    // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 20MHz for SDSPI)
+    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.max_freq_khz = 1000;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return ret;
+    }
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    if (ret != ESP_OK)
+    {
+        if (ret == ESP_FAIL)
+        {
+            ESP_LOGE(TAG, "Failed to mount filesystem. "
+                          "If you want the card to be formatted, set the CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                          "Make sure SD card lines have pull-up resistors in place.",
+                     esp_err_to_name(ret));
+        }
+        return ret;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted");
+     // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
+    
+    
+    return ret;
+}
 void app_main(void)
 {
     i2s_install();
     i2s_setpin();
     i2s_start(I2S_PORT);
     gpio_config_pin();
+    sd_card_init();
     /* Step 3: Create writing and reading task, enable and start the channels */
     xTaskCreate(i2s_example_read_task, "i2s_example_read_task", 4096, NULL, 5, NULL);
 }
