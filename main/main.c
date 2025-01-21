@@ -93,9 +93,9 @@ void get_fft_peaks(float *y1_cf, float *fft_max_vals, int *fft_max_freq)
     for (size_t i = 0; i < FFT_SIZE / 2; i++)
     {
         // Calculate the logarithmic value for the FFT
-        y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
-                                y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
-                               FFT_SIZE);
+        // y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
+        //                         y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
+        //                        FFT_SIZE);
 
         // Skip the first 64 and the last element
         if (i > 64 && i < ((FFT_SIZE / 2) - 1))
@@ -155,8 +155,8 @@ static void mic_read_task(void *args)
     int64_t start_time = 0; // Variable to hold the start time
     int64_t end_time = 0;   // Variable to hold the end time
     int64_t elapsed_time = 0;
-    uint32_t fft_max_vals[3] = {0};
-    uint32_t fft_max_freq[3] = {0};
+    float fft_max_vals[3] = {0};
+    int fft_max_freq[3] = {0};
     esp_err_t ret;
 
     ret = dsps_fft2r_init_fc32(NULL, 2 * FFT_SIZE);
@@ -221,11 +221,25 @@ static void mic_read_task(void *args)
                     if (j > 0)
                     {
                         fft_calc(y_cf, fft_max_vals, fft_max_freq);
-                        printf("Max 1: %lu at freq %lu\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                        printf("Max 2: %lu at freq %lu\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                        printf("Max 3: %lu at freq %lu\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                        fft_max_vals[0] += fft_max_vals[0];
+                        fft_max_vals[1] += fft_max_vals[1];
+                        fft_max_vals[2] += fft_max_vals[2];
+                        fft_max_freq[0] += fft_max_freq[0];
+                        fft_max_freq[1] += fft_max_freq[1];
+                        fft_max_freq[2] += fft_max_freq[2];
                     }
                 }
+                uint8_t fft_iterarion = (sample_count / FFT_SIZE) - 1;
+                fft_max_vals[0] = fft_max_vals[0]/fft_iterarion; 
+                fft_max_vals[1] = fft_max_vals[1]/fft_iterarion; 
+                fft_max_vals[2] = fft_max_vals[2]/fft_iterarion; 
+                fft_max_freq[0] = fft_max_freq[0]/fft_iterarion; 
+                fft_max_freq[1] = fft_max_freq[1]/fft_iterarion; 
+                fft_max_freq[2] = fft_max_freq[2]/fft_iterarion; 
+
+                printf("Max 1: %f at freq %d\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                printf("Max 2: %f at freq %d\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                printf("Max 3: %f at freq %d\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
             }
             i2s_stop(I2S_PORT);
             sample_count = 0; // Reset sample count
