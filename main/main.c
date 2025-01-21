@@ -35,21 +35,24 @@ const char *TAG = "[MAIN]";
 #define I2S_PORT I2S_NUM_0
 #define I2S_SAMPLE_RATE 8192
 #define I2S_BUFFER_SIZE 256
-#define FFT_SIZE CONFIG_DSP_MAX_FFT_SIZE
+#define FFT_SIZE (CONFIG_DSP_MAX_FFT_SIZE >> 1)
 #define MAIN_BUTTON GPIO_NUM_21
 #define GPIO_INPUT_PIN_SEL (1ULL << GPIO_NUM_21)
 #define I2S_BUFFER_32_TOTAL_SIZE I2S_SAMPLE_RATE
-#define I2S_BUFFER_16_TOTAL_SIZE I2S_SAMPLE_RATE >> 2
-#define I2S_TWO_PERIOD_BUFFER_SIZE I2S_SAMPLE_RATE << 1
+#define I2S_BUFFER_16_TOTAL_SIZE (I2S_SAMPLE_RATE >> 2)
+#define I2S_TWO_PERIOD_BUFFER_SIZE (I2S_SAMPLE_RATE << 1)
 
 int16_t i2s_buffer[I2S_TWO_PERIOD_BUFFER_SIZE] = {0};
 uint8_t buffer32[I2S_BUFFER_32_TOTAL_SIZE] = {0};
-int16_t buffer16[I2S_BUFFER_16_TOTAL_SIZE] = {0};
 
 // Input test array
 __attribute__((aligned(16))) float x1[FFT_SIZE];
 // Window coefficients
 __attribute__((aligned(16))) float wind[FFT_SIZE];
+// working complex array
+__attribute__((aligned(16))) float y_cf[FFT_SIZE * 2];
+// Pointers to result arrays
+float *y1_cf = &y_cf[0];
 
 void i2s_install()
 {
@@ -80,6 +83,71 @@ void i2s_setpin()
     i2s_set_pin(I2S_PORT, &pin_config);
 }
 
+void get_fft_peaks(float *y1_cf, float *fft_max_vals, int *fft_max_freq)
+{
+    // Initialize the top three peaks and their frequencies
+    fft_max_vals[0] = fft_max_vals[1] = fft_max_vals[2] = 0;
+    fft_max_freq[0] = fft_max_freq[1] = fft_max_freq[2] = 0;
+
+    // Process the FFT array
+    for (size_t i = 0; i < FFT_SIZE / 2; i++)
+    {
+        // Calculate the logarithmic value for the FFT
+        y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
+                                y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
+                               FFT_SIZE);
+
+        // Skip the first 64 and the last element
+        if (i > 64 && i < ((FFT_SIZE / 2) - 1))
+        {
+            // Check if it's a local maximum
+            if (y1_cf[i] > y1_cf[i - 1] && y1_cf[i] > y1_cf[i + 1])
+            {
+                // Compare with current top peaks
+                if (y1_cf[i] > fft_max_vals[0])
+                {
+                    // Shift down the peaks
+                    fft_max_vals[2] = fft_max_vals[1];
+                    fft_max_freq[2] = fft_max_freq[1];
+                    fft_max_vals[1] = fft_max_vals[0];
+                    fft_max_freq[1] = fft_max_freq[0];
+                    fft_max_vals[0] = y1_cf[i];
+                    fft_max_freq[0] = i;
+                }
+                else if (y1_cf[i] > fft_max_vals[1])
+                {
+                    fft_max_vals[2] = fft_max_vals[1];
+                    fft_max_freq[2] = fft_max_freq[1];
+                    fft_max_vals[1] = y1_cf[i];
+                    fft_max_freq[1] = i;
+                }
+                else if (y1_cf[i] > fft_max_vals[2])
+                {
+                    fft_max_vals[2] = y1_cf[i];
+                    fft_max_freq[2] = i;
+                }
+            }
+        }
+    }
+}
+
+void fft_calc(float *y_cf, float *fft_max_vals, int *fft_max_freq)
+{
+    // Record start time for performance measurement
+    unsigned int start_r2 = dsp_get_cpu_cycle_count();
+    // Perform FFT radix-2 transformation
+    dsps_fft2r_fc32(y_cf, FFT_SIZE);
+    // Perform bit reversal for the FFT
+    dsps_bit_rev2r_fc32(y_cf, FFT_SIZE);
+    // Convert complex vector to real spectrum
+    dsps_cplx2real_fc32(y_cf, FFT_SIZE);
+    // Record end time for performance measurement
+    unsigned int end_r2 = dsp_get_cpu_cycle_count();
+    printf("FFT calculation time: %u cycles\n", end_r2 - start_r2);
+    // Get the top 3 FFT peaks
+    get_fft_peaks(y_cf, fft_max_vals, fft_max_freq);
+}
+
 static void mic_read_task(void *args)
 {
     int pos = 0;
@@ -87,9 +155,11 @@ static void mic_read_task(void *args)
     int64_t start_time = 0; // Variable to hold the start time
     int64_t end_time = 0;   // Variable to hold the end time
     int64_t elapsed_time = 0;
+    uint32_t fft_max_vals[3] = {0};
+    uint32_t fft_max_freq[3] = {0};
     esp_err_t ret;
 
-    ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE >> 1);
+    ret = dsps_fft2r_init_fc32(NULL, 2 * FFT_SIZE);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Not possible to initialize FFT. Error = %i", ret);
@@ -117,19 +187,12 @@ static void mic_read_task(void *args)
             }
             // Read I2S data buffer
             int16_t samples_read = bytes_read / 4;
-            // for (size_t i = 0; i < samples_read / 2; ++i)
             for (size_t i = 0; i < samples_read; ++i)
             {
                 uint8_t mid = buffer32[i * 4 + 2];
                 uint8_t msb = buffer32[i * 4 + 3];
-                // uint8_t mid = buffer32[2 * i * 4 + 2];
-                // uint8_t msb = buffer32[2 * i * 4 + 3];
                 uint16_t raw = (((uint32_t)msb) << 8) + ((uint32_t)mid);
-                // memcpy(&buffer16[i], &raw, sizeof(raw));
                 memcpy(&i2s_buffer[i + (j * (I2S_BUFFER_16_TOTAL_SIZE))], &raw, sizeof(raw));
-                // memcpy(&i2s_buffer[i + (j * (I2S_BUFFER_16_TOTAL_SIZE >> 2))], &raw, sizeof(raw));
-                // i2s_buffer[i + (j * I2S_BUFFER_16_TOTAL_SIZE)] = (buffer16[i]);
-                // x1[i + (j * I2S_BUFFER_16_TOTAL_SIZE)] = (float)(buffer16[i] /* * wind[i + j * I2S_BUFFER_SIZE] */);
             }
 
             sample_count += samples_read;
@@ -137,58 +200,35 @@ static void mic_read_task(void *args)
             printf("j = %d\r\n", j);
             if (j >= 8)
             {
-                i2s_stop(I2S_PORT);
-                end_time = esp_timer_get_time();      // Get the end time in microseconds
-                elapsed_time = end_time - start_time; // Calculate elapsed time in microseconds
                 break;
             }
-
-            // if (j >= 2)
-            // {
-            //     j = 0;
-            //     for (int i = 0; i < FFT_SIZE; i++)
-            //     {
-            //         printf("%f\r\n", x1[i]);
-            //     }
-            //     ESP_LOGI(TAG, "Writing file");
-            //     ret = sd_write_file(file_data, data);
-            //     if (ret != ESP_OK)
-            //     {
-            //         ESP_LOGE(TAG, "Failed to write file. Error = %i", ret);
-            //         return;
-            //     }
-            //     // FFT Radix-2
-            //     unsigned int start_r2 = dsp_get_cpu_cycle_count();
-            //     dsps_fft2r_fc32(x1, FFT_SIZE >> 1);
-            //     // Bit reverse
-            //     dsps_bit_rev2r_fc32(x1, FFT_SIZE >> 1);
-            //     // Convert one complex vector with length N/2 to one real spectrum vector with length N/2
-            //     dsps_cplx2real_fc32(x1, FFT_SIZE >> 1);
-            //     unsigned int end_r2 = dsp_get_cpu_cycle_count();
-
-            //     // for (int i = 0; i < FFT_SIZE / 2; i++)
-            //     // {
-            //     //     // printf("%f\r\n", x1[i]);
-            //     // }
-            //     // Show power spectrum in 64x10 window from -100 to 0 dB from 0..N/4 samples
-            //     /*                 ESP_LOGW(TAG, "Signal x1");
-            //                     dsps_view(x1, FFT_SIZE / 2, 64, 20, 0, 500, '|');
-            //                     ESP_LOGI(TAG, "FFT Radix 2 for %i complex points take %i cycles", FFT_SIZE / 2, end_r2 - start_r2); */
-            // }
         }
         if (sample_count > 0)
         {
+            end_time = esp_timer_get_time();      // Get the end time in microseconds
+            elapsed_time = end_time - start_time; // Calculate elapsed time in microseconds
             ESP_LOGI(TAG, "Read %lu samples. Total elapsed time: %lld ms", sample_count, elapsed_time / 1000);
             if (elapsed_time / 1000 >= 2000)
             {
-                for (size_t i = 0; i < sample_count; i++)
+                for (size_t j = 0; j < sample_count / FFT_SIZE; j++)
                 {
-                    printf("%d\r\n", i2s_buffer[i]);
+                    for (size_t i = 0; i < FFT_SIZE; i++)
+                    {
+                        x1[i] = (float)(i2s_buffer[i + (j * FFT_SIZE)] * wind[i]);
+                        y1_cf[2 * i] = x1[i];
+                        y1_cf[2 * i + 1] = 0;
+                    }
+                    if (j > 0)
+                    {
+                        fft_calc(y_cf, fft_max_vals, fft_max_freq);
+                        printf("Max 1: %lu at freq %lu\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                        printf("Max 2: %lu at freq %lu\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                        printf("Max 3: %lu at freq %lu\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                    }
                 }
             }
+            i2s_stop(I2S_PORT);
             sample_count = 0; // Reset sample count
-
-            vTaskDelay(pdMS_TO_TICKS(2000));
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
