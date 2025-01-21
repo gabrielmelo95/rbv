@@ -85,13 +85,17 @@ const char *TAG = "[MAIN]";
 // LVGL library is not thread-safe, this example will call LVGL APIs from different tasks, so use a mutex to protect it
 static _lock_t lvgl_api_lock;
 lv_display_t *display = NULL;
-extern void example_lvgl_demo_ui(lv_disp_t *disp);
 esp_lcd_panel_io_handle_t io_handle = NULL;
 esp_lcd_panel_handle_t panel_handle = NULL;
+static lv_obj_t *btn_register;
+static lv_obj_t *btn_indentify;
+static lv_display_rotation_t rotation = LV_DISP_ROTATION_0;
 
 int16_t i2s_buffer[I2S_TWO_PERIOD_BUFFER_SIZE] = {0};
 uint8_t buffer32[I2S_BUFFER_32_TOTAL_SIZE] = {0};
+uint8_t click_button_pos = 0;
 
+static QueueHandle_t gpio_evt_queue = NULL;
 // Input test array
 __attribute__((aligned(16))) float x1[FFT_SIZE];
 // Window coefficients
@@ -113,7 +117,7 @@ static void lvgl_port_update_callback(lv_display_t *disp)
 {
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
     lv_display_rotation_t rotation = lv_display_get_rotation(disp);
-
+    rotation = LV_DISPLAY_ROTATION_90;
     switch (rotation)
     {
     case LV_DISPLAY_ROTATION_0:
@@ -172,6 +176,37 @@ static void lvgl_port_task(void *arg)
         // in case of triggering a task watch dog time out
         time_till_next_ms = MAX(time_till_next_ms, time_threshold_ms);
         usleep(1000 * time_till_next_ms);
+    }
+}
+
+static void IRAM_ATTR gpio_isr_handler(void *arg)
+{
+    uint32_t gpio_num = (uint32_t)arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void gpio_get_level_task(void *arg)
+{
+    uint32_t io_num;
+    bool gpio_high_level_flag = false;
+    for (;;)
+    {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
+        {
+            if (io_num == MAIN_BUTTON)
+            {
+                if (gpio_get_level(io_num) && gpio_high_level_flag == false)
+                {
+                    gpio_high_level_flag = true;
+                    click_button_pos++;
+                    lv_obj_send_event(btn_register, LV_EVENT_CLICKED, display);
+                }
+                else if (gpio_get_level(io_num) == 0)
+                {
+                    gpio_high_level_flag = false;
+                }
+            }
+        }
     }
 }
 
@@ -264,7 +299,7 @@ void fft_calc(float *y_cf, float *fft_max_vals, int *fft_max_freq)
     dsps_cplx2real_fc32(y_cf, FFT_SIZE);
     // Record end time for performance measurement
     unsigned int end_r2 = dsp_get_cpu_cycle_count();
-    printf("FFT calculation time: %u cycles\n", end_r2 - start_r2);
+    // printf("FFT calculation time: %u cycles\n", end_r2 - start_r2);
     // Get the top 3 FFT peaks
     get_fft_peaks(y_cf, fft_max_vals, fft_max_freq);
 }
@@ -373,13 +408,16 @@ static void mic_read_task(void *args)
 void gpio_config_pin(void)
 {
     gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
     io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
 
     gpio_config(&io_conf);
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(MAIN_BUTTON, gpio_isr_handler, (void *)MAIN_BUTTON);
 }
 
 void spi_configuration()
@@ -471,6 +509,36 @@ void initialize_lvgl()
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, display));
 }
 
+static void btn_cb(lv_event_t *e)
+{
+    if (click_button_pos % 2)
+    {
+        lv_obj_set_style_bg_color(btn_register, lv_color_hex(0xFFA500), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn_indentify, lv_color_hex(0x0000FF), LV_PART_MAIN);
+    }
+    else
+    {
+        lv_obj_set_style_bg_color(btn_register, lv_color_hex(0x0000FF), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn_indentify, lv_color_hex(0xFFA500), LV_PART_MAIN);
+    }
+}
+
+void example_lvgl_demo_ui(lv_display_t *disp)
+{
+    lv_obj_t *scr = lv_display_get_screen_active(disp);
+
+    btn_register = lv_button_create(scr);
+    lv_obj_t *lbl_register = lv_label_create(btn_register);
+    lv_label_set_text_static(lbl_register, LV_SYMBOL_UPLOAD " CADASTRAR");
+    lv_obj_align(btn_register, LV_ALIGN_TOP_MID, 0, 60);
+    /*Button event*/
+    lv_obj_add_event_cb(btn_register, btn_cb, LV_EVENT_CLICKED, disp);
+
+    btn_indentify = lv_button_create(scr);
+    lv_obj_t *lbl_identify = lv_label_create(btn_indentify);
+    lv_label_set_text_static(lbl_identify, LV_SYMBOL_DOWNLOAD " IDENTIFICAR");
+    lv_obj_align(btn_indentify, LV_ALIGN_BOTTOM_MID, 0, -60);
+}
 void app_main(void)
 {
     i2s_install();
@@ -480,6 +548,8 @@ void app_main(void)
     display_config();
     initialize_lvgl();
 
+    ESP_LOGI(TAG, "Create GPIO task");
+    xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10, NULL);
     ESP_LOGI(TAG, "Create LVGL task");
     xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, NULL);
 
@@ -489,5 +559,5 @@ void app_main(void)
     example_lvgl_demo_ui(display);
     _lock_release(&lvgl_api_lock);
     vTaskDelay(pdMS_TO_TICKS(500));
-    // xTaskCreate(mic_read_task, "mic_read_task", 4096, NULL, 5, NULL);
+    xTaskCreate(mic_read_task, "mic_read_task", 4096, NULL, 5, NULL);
 }
