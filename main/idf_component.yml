@@ -1,7 +1,11 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/esp-dsp: "*"
-  ## Required IDF version
+  lvgl/lvgl: "9.2.0"
+  esp_lcd_ili9341: "^1.0"
+  esp_lcd_gc9a01: "^1.0"
+  esp_lcd_touch_stmpe610: "^1.0"
+  ## Required IDF version0
   idf:
     version: ">=4.1.0"
   # # Put list of dependencies here
