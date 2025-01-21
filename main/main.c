@@ -89,7 +89,15 @@ esp_lcd_panel_io_handle_t io_handle = NULL;
 esp_lcd_panel_handle_t panel_handle = NULL;
 static lv_obj_t *btn_register;
 static lv_obj_t *btn_indentify;
+static lv_obj_t *check_db_txt;
 static lv_display_rotation_t rotation = LV_DISP_ROTATION_0;
+int64_t button_start_time = 0; // Variable to hold the start time
+int64_t button_end_time = 0;   // Variable to hold the end time
+int64_t button_elapsed_time = 0;
+
+TaskHandle_t gpio_task_handle = NULL;
+TaskHandle_t lvgl_task_handle = NULL;
+TaskHandle_t i2s_mic_task_handle = NULL;
 
 int16_t i2s_buffer[I2S_TWO_PERIOD_BUFFER_SIZE] = {0};
 uint8_t buffer32[I2S_BUFFER_32_TOTAL_SIZE] = {0};
@@ -198,15 +206,26 @@ static void gpio_get_level_task(void *arg)
                 if (gpio_get_level(io_num) && gpio_high_level_flag == false)
                 {
                     gpio_high_level_flag = true;
-                    click_button_pos++;
                     lv_obj_send_event(btn_register, LV_EVENT_CLICKED, display);
+                    button_start_time = esp_timer_get_time();
+                    click_button_pos++;
                 }
-                else if (gpio_get_level(io_num) == 0)
+                else if (gpio_get_level(io_num) == 0 && gpio_high_level_flag == true)
                 {
                     gpio_high_level_flag = false;
+                    button_end_time = esp_timer_get_time();
+                    button_elapsed_time = button_start_time - button_end_time;
+                    if ((button_elapsed_time) / 1000 < 500)
+                    {
+                    }
+                    else if ((button_elapsed_time) / 1000 >= 1000)
+                    {
+                        // lv_obj_send_event(btn_register, LV_EVENT_LONG_PRESSED, display);
+                    }
                 }
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -249,10 +268,10 @@ void get_fft_peaks(float *y1_cf, float *fft_max_vals, int *fft_max_freq)
     for (size_t i = 0; i < FFT_SIZE / 2; i++)
     {
         // Calculate the logarithmic value for the FFT
-        // y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
-        //                         y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
-        //                        FFT_SIZE);
-
+        y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
+                                y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
+                               FFT_SIZE);
+        printf("%.2f\r\n", y1_cf[i]);
         // Skip the first 64 and the last element
         if (i > 64 && i < ((FFT_SIZE / 2) - 1))
         {
@@ -312,7 +331,9 @@ static void mic_read_task(void *args)
     int64_t end_time = 0;   // Variable to hold the end time
     int64_t elapsed_time = 0;
     float fft_max_vals[3] = {0};
+    float fft_max_vals_avg[3] = {0};
     int fft_max_freq[3] = {0};
+    int fft_max_freq_avg[3] = {0};
     esp_err_t ret;
 
     ret = dsps_fft2r_init_fc32(NULL, 2 * FFT_SIZE);
@@ -331,7 +352,10 @@ static void mic_read_task(void *args)
         {
             if (sample_count == 0)
             {
+                vTaskSuspend(lvgl_task_handle);
+                vTaskSuspend(gpio_task_handle);
                 i2s_start(I2S_PORT);
+                memset(i2s_buffer, 0, sizeof(i2s_buffer));
                 start_time = esp_timer_get_time(); // Get the start time in microseconds
             }
             size_t bytes_read = 0;
@@ -364,7 +388,7 @@ static void mic_read_task(void *args)
             end_time = esp_timer_get_time();      // Get the end time in microseconds
             elapsed_time = end_time - start_time; // Calculate elapsed time in microseconds
             ESP_LOGI(TAG, "Read %lu samples. Total elapsed time: %lld ms", sample_count, elapsed_time / 1000);
-            if (elapsed_time / 1000 >= 2000)
+            if (elapsed_time / 1000 >= 1800)
             {
                 for (size_t j = 0; j < sample_count / FFT_SIZE; j++)
                 {
@@ -377,26 +401,31 @@ static void mic_read_task(void *args)
                     if (j > 0)
                     {
                         fft_calc(y_cf, fft_max_vals, fft_max_freq);
-                        fft_max_vals[0] += fft_max_vals[0];
-                        fft_max_vals[1] += fft_max_vals[1];
-                        fft_max_vals[2] += fft_max_vals[2];
-                        fft_max_freq[0] += fft_max_freq[0];
-                        fft_max_freq[1] += fft_max_freq[1];
-                        fft_max_freq[2] += fft_max_freq[2];
+                        fft_max_vals_avg[0] += fft_max_vals[0];
+                        fft_max_vals_avg[1] += fft_max_vals[1];
+                        fft_max_vals_avg[2] += fft_max_vals[2];
+                        fft_max_freq_avg[0] += fft_max_freq[0];
+                        fft_max_freq_avg[1] += fft_max_freq[1];
+                        fft_max_freq_avg[2] += fft_max_freq[2];
+                        printf("Max 1: %f at freq %d\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                        printf("Max 2: %f at freq %d\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                        printf("Max 3: %f at freq %d\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
                     }
                 }
                 uint8_t fft_iterarion = (sample_count / FFT_SIZE) - 1;
-                fft_max_vals[0] = fft_max_vals[0] / fft_iterarion;
-                fft_max_vals[1] = fft_max_vals[1] / fft_iterarion;
-                fft_max_vals[2] = fft_max_vals[2] / fft_iterarion;
-                fft_max_freq[0] = fft_max_freq[0] / fft_iterarion;
-                fft_max_freq[1] = fft_max_freq[1] / fft_iterarion;
-                fft_max_freq[2] = fft_max_freq[2] / fft_iterarion;
+                fft_max_vals_avg[0] = fft_max_vals_avg[0] / fft_iterarion;
+                fft_max_vals_avg[1] = fft_max_vals_avg[1] / fft_iterarion;
+                fft_max_vals_avg[2] = fft_max_vals_avg[2] / fft_iterarion;
+                fft_max_freq_avg[0] = fft_max_freq_avg[0] / fft_iterarion;
+                fft_max_freq_avg[1] = fft_max_freq_avg[1] / fft_iterarion;
+                fft_max_freq_avg[2] = fft_max_freq_avg[2] / fft_iterarion;
 
-                printf("Max 1: %f at freq %d\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                printf("Max 2: %f at freq %d\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                printf("Max 3: %f at freq %d\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                printf("Max avg 1: %f at freq %d\n", fft_max_vals_avg[0], (fft_max_freq_avg[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                printf("Max avg 2: %f at freq %d\n", fft_max_vals_avg[1], (fft_max_freq_avg[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                printf("Max avg 3: %f at freq %d\n", fft_max_vals_avg[2], (fft_max_freq_avg[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
             }
+            vTaskResume(gpio_task_handle);
+            vTaskResume(lvgl_task_handle);
             i2s_stop(I2S_PORT);
             sample_count = 0; // Reset sample count
         }
@@ -523,7 +552,28 @@ static void btn_cb(lv_event_t *e)
     }
 }
 
-void example_lvgl_demo_ui(lv_display_t *disp)
+void lvgl_ui_db_menu(lv_display_t *disp)
+{
+    ESP_LOGI(TAG, "Creating a new screen");
+    // Create a new screen
+    lv_obj_t *db_scr = lv_obj_create(NULL);
+
+    // Add a title label to the new screen
+    lv_obj_t *lbl_title = lv_label_create(db_scr);
+    lv_label_set_text(lbl_title, LV_SYMBOL_DOWNLOAD "CONSULTANDO DB");
+    lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
+
+    lv_disp_load_scr(db_scr);
+}
+
+static void btn_cb_long_press(lv_event_t *e)
+{
+    lv_display_t *disp = (lv_display_t *)lv_event_get_user_data(e);
+    // Switch to the new page
+    lvgl_ui_db_menu(disp);
+}
+
+void lvgl_ui_main_menu(lv_display_t *disp)
 {
     lv_obj_t *scr = lv_display_get_screen_active(disp);
 
@@ -533,12 +583,14 @@ void example_lvgl_demo_ui(lv_display_t *disp)
     lv_obj_align(btn_register, LV_ALIGN_TOP_MID, 0, 60);
     /*Button event*/
     lv_obj_add_event_cb(btn_register, btn_cb, LV_EVENT_CLICKED, disp);
+    lv_obj_add_event_cb(btn_register, btn_cb_long_press, LV_EVENT_LONG_PRESSED, disp);
 
     btn_indentify = lv_button_create(scr);
     lv_obj_t *lbl_identify = lv_label_create(btn_indentify);
     lv_label_set_text_static(lbl_identify, LV_SYMBOL_DOWNLOAD " IDENTIFICAR");
     lv_obj_align(btn_indentify, LV_ALIGN_BOTTOM_MID, 0, -60);
 }
+
 void app_main(void)
 {
     i2s_install();
@@ -549,15 +601,15 @@ void app_main(void)
     initialize_lvgl();
 
     ESP_LOGI(TAG, "Create GPIO task");
-    xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10, NULL);
+    xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10, &gpio_task_handle);
     ESP_LOGI(TAG, "Create LVGL task");
-    xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, NULL);
+    xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, &lvgl_task_handle);
 
     ESP_LOGI(TAG, "Display LVGL Meter Widget");
     // Lock the mutex due to the LVGL APIs are not thread-safe
     _lock_acquire(&lvgl_api_lock);
-    example_lvgl_demo_ui(display);
+    lvgl_ui_main_menu(display);
     _lock_release(&lvgl_api_lock);
     vTaskDelay(pdMS_TO_TICKS(500));
-    xTaskCreate(mic_read_task, "mic_read_task", 4096, NULL, 5, NULL);
+    xTaskCreate(mic_read_task, "mic_read_task", 4096, NULL, 5, &i2s_mic_task_handle);
 }
