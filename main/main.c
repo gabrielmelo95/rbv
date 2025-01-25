@@ -87,12 +87,15 @@ const char *TAG = "[MAIN]";
 // LVGL library is not thread-safe, this example will call LVGL APIs from
 // different tasks, so use a mutex to protect it
 static _lock_t lvgl_api_lock;
-lv_display_t *display = NULL;
 esp_lcd_panel_io_handle_t io_handle = NULL;
 esp_lcd_panel_handle_t panel_handle = NULL;
+
+static lv_display_t *display = NULL;
 static lv_obj_t *btn_register;
 static lv_obj_t *btn_identify;
 static lv_obj_t *check_db_txt;
+static lv_obj_t *db_preload;
+
 static lv_display_rotation_t rotation = LV_DISP_ROTATION_0;
 int64_t button_start_time = 0; // Variable to hold the start time
 int64_t button_end_time = 0;   // Variable to hold the end time
@@ -374,15 +377,25 @@ static void rbv_task(void *args)
                 main_menu_buttom_pos++;
             } else if (gpio_long_press_release_flag == true) {
                 gpio_long_press_release_flag = false;
-                if (main_menu_buttom_pos % 2 == 0) {
-                    lv_obj_send_event(btn_register, LV_EVENT_LONG_PRESSED,
-                                      NULL);
-                } else {
-                    lv_obj_send_event(btn_identify, LV_EVENT_LONG_PRESSED,
-                                      NULL);
-                }
+                rbv_screen = SEARCHING_MENU;
             }
-
+            break;
+        case SEARCHING_MENU :
+            if (main_menu_buttom_pos % 2 == 0) {
+                rbv_screen = IDENTIFY_MENU;
+                lv_obj_send_event(btn_identify, LV_EVENT_LONG_PRESSED, NULL);
+            } else {
+                rbv_screen = REGISTER_MENU;
+                lv_obj_send_event(btn_register, LV_EVENT_LONG_PRESSED, NULL);
+            }
+            break;
+        case REGISTER_MENU :
+            ESP_LOGI(TAG, "REGISTER_MENU");
+            vTaskDelay(portMAX_DELAY);
+            break;
+        case IDENTIFY_MENU :
+            ESP_LOGI(TAG, "IDENTIFY_MENU");
+            vTaskDelay(portMAX_DELAY);
             break;
 
         default :
@@ -612,29 +625,18 @@ static void id_btn_cb(lv_event_t *e)
 void lvgl_ui_db_menu(lv_display_t *disp)
 {
     // Create a new screen
-    lv_obj_t *db_scr = lv_obj_create(NULL);
-
-    // Add a title label to the new screen
-    lv_obj_t *lbl_title = lv_label_create(db_scr);
-    lv_label_set_text(lbl_title, LV_SYMBOL_DOWNLOAD " CONSULTANDO DB");
-    lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
-
-    lv_disp_load_scr(db_scr);
+    lv_obj_del(btn_identify);
+    lv_obj_del(btn_register);
+    lv_obj_t *scr = lv_display_get_screen_active(disp);
+    db_preload = lv_spinner_create(scr);
+    lv_obj_set_size(db_preload, 40, 40);
+    lv_obj_center(db_preload);
+    lv_spinner_set_anim_params(db_preload, 1000, 200);
 }
 
-static void reg_btn_long_press_cb(lv_event_t *e)
-{
-    lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
-    // Switch to the new page
-    lvgl_ui_db_menu(disp);
-}
+static void reg_btn_long_press_cb(lv_event_t *e) { lvgl_ui_db_menu(display); }
 
-static void id_btn_long_press_cb(lv_event_t *e)
-{
-    lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
-    // Switch to the new page
-    lvgl_ui_db_menu(disp);
-}
+static void id_btn_long_press_cb(lv_event_t *e) { lvgl_ui_db_menu(display); }
 
 void lvgl_ui_main_menu(lv_display_t *disp)
 {
