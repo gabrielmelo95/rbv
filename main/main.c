@@ -121,7 +121,7 @@ TaskHandle_t i2s_mic_task_handle = NULL;
 
 int16_t i2s_buffer[I2S_TWO_PERIOD_BUFFER_SIZE] = {0};
 uint8_t buffer32[I2S_BUFFER_32_TOTAL_SIZE] = {0};
-uint8_t click_button_pos = 0;
+uint8_t main_menu_buttom_pos = 0;
 
 static QueueHandle_t gpio_evt_queue = NULL;
 // Input test array
@@ -245,24 +245,6 @@ static void gpio_get_level_task(void *arg)
                         gpio_pressed_flag = false;
                         gpio_cklicked_flag = false;
                         gpio_long_press_release_flag = true;
-                        // btn_reg_style = lv_obj_get_style_prop(
-                        //     btn_register, LV_PART_MAIN, LV_STYLE_BG_COLOR);
-                        // printf("Style bg register btn color: %ld\r\n",
-                        //        btn_reg_style.num);
-                        // btn_indentify_style = lv_obj_get_style_prop(
-                        //     btn_identify, LV_PART_MAIN, LV_STYLE_BG_COLOR);
-                        // printf("Style bg identify btn color: %ld\r\n",
-                        //        btn_indentify_style.num);
-
-                        // if (btn_reg_style.num == ORAGNE_COLOR) {
-                        //     lv_obj_send_event(btn_register,
-                        //                       LV_EVENT_LONG_PRESSED,
-                        //                       display);
-                        // } else {
-                        //     lv_obj_send_event(btn_identify,
-                        //                       LV_EVENT_LONG_PRESSED,
-                        //                       display);
-                        // }
                     }
                 }
             }
@@ -384,13 +366,23 @@ static void rbv_task(void *args)
             uint8_t j = 0;
             if (gpio_cklicked_flag == true) {
                 gpio_cklicked_flag = false;
-                if (click_button_pos % 2 == 0) {
+                if (main_menu_buttom_pos % 2 == 0) {
                     lv_obj_send_event(btn_register, LV_EVENT_CLICKED, NULL);
                 } else {
                     lv_obj_send_event(btn_identify, LV_EVENT_CLICKED, NULL);
                 }
-                click_button_pos++;
+                main_menu_buttom_pos++;
+            } else if (gpio_long_press_release_flag == true) {
+                gpio_long_press_release_flag = false;
+                if (main_menu_buttom_pos % 2 == 0) {
+                    lv_obj_send_event(btn_register, LV_EVENT_LONG_PRESSED,
+                                      NULL);
+                } else {
+                    lv_obj_send_event(btn_identify, LV_EVENT_LONG_PRESSED,
+                                      NULL);
+                }
             }
+
             break;
 
         default :
@@ -630,7 +622,14 @@ void lvgl_ui_db_menu(lv_display_t *disp)
     lv_disp_load_scr(db_scr);
 }
 
-static void btn_cb_long_press(lv_event_t *e)
+static void reg_btn_long_press_cb(lv_event_t *e)
+{
+    lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
+    // Switch to the new page
+    lvgl_ui_db_menu(disp);
+}
+
+static void id_btn_long_press_cb(lv_event_t *e)
 {
     lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
     // Switch to the new page
@@ -649,8 +648,8 @@ void lvgl_ui_main_menu(lv_display_t *disp)
     lv_obj_align(btn_register, LV_ALIGN_TOP_MID, 0, 60);
     /*Button event*/
     lv_obj_add_event_cb(btn_register, reg_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(btn_register, btn_cb_long_press, LV_EVENT_LONG_PRESSED,
-                        disp);
+    lv_obj_add_event_cb(btn_register, reg_btn_long_press_cb,
+                        LV_EVENT_LONG_PRESSED, disp);
 
     btn_identify = lv_button_create(scr);
     lv_obj_t *lbl_identify = lv_label_create(btn_identify);
@@ -660,8 +659,8 @@ void lvgl_ui_main_menu(lv_display_t *disp)
     lv_obj_align(btn_identify, LV_ALIGN_BOTTOM_MID, 0, -60);
     lv_obj_add_event_cb(btn_identify, id_btn_cb, LV_EVENT_CLICKED,
                         &main_menu_btn);
-    lv_obj_add_event_cb(btn_identify, btn_cb_long_press, LV_EVENT_LONG_PRESSED,
-                        disp);
+    lv_obj_add_event_cb(btn_identify, id_btn_long_press_cb,
+                        LV_EVENT_LONG_PRESSED, disp);
 }
 
 void app_main(void)
