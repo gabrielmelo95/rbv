@@ -4,39 +4,38 @@
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 #include <math.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/lock.h>
 #include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
+#include <unistd.h>
 
+#include "driver/gpio.h"
+#include "driver/i2s.h"
+#include "driver/spi_common.h"
+#include "driver/spi_master.h"
+#include "esp_check.h"
+#include "esp_dsp.h"
+#include "esp_err.h"
+#include "esp_lcd_gc9a01.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2s.h"
-#include "driver/gpio.h"
-#include "esp_check.h"
-#include "sdkconfig.h"
-#include "esp_system.h"
-#include "soc/gpio_struct.h"
-#include "driver/gpio.h"
-#include "esp_dsp.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "esp_timer.h"
-#include "esp_lcd_gc9a01.h"
 #include "lvgl.h"
-#include "driver/spi_master.h"
-#include "driver/spi_common.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_err.h"
-#include "esp_log.h"
+#include "sdkconfig.h"
+#include "sdmmc_cmd.h"
+#include "soc/gpio_struct.h"
 
 const char *TAG = "[MAIN]";
 
@@ -68,7 +67,7 @@ const char *TAG = "[MAIN]";
 /* LCD defs */
 #define LCD_PIXEL_CLOCK_HZ (1 * 1000 * 1000)
 #define LCD_BK_LIGHT_ON_LEVEL 1
-#define LCD_BK_LIGHT_OFF_LEVEL !EXAMPLE_LCD_BK_LIGHT_ON_LEVEL
+#define LCD_BK_LIGHT_OFF_LEVEL ! EXAMPLE_LCD_BK_LIGHT_ON_LEVEL
 #define LCD_H_RES 240
 #define LCD_V_RES 240
 #define LCD_CMD_BITS 8
@@ -82,18 +81,39 @@ const char *TAG = "[MAIN]";
 #define LVGL_TASK_STACK_SIZE (4 * 1024)
 #define LVGL_TASK_PRIORITY 2
 
-// LVGL library is not thread-safe, this example will call LVGL APIs from different tasks, so use a mutex to protect it
+#define BLUE_COLOR 0x0000FF
+#define ORAGNE_COLOR 0xFFA500
+
+// LVGL library is not thread-safe, this example will call LVGL APIs from
+// different tasks, so use a mutex to protect it
 static _lock_t lvgl_api_lock;
 lv_display_t *display = NULL;
 esp_lcd_panel_io_handle_t io_handle = NULL;
 esp_lcd_panel_handle_t panel_handle = NULL;
 static lv_obj_t *btn_register;
-static lv_obj_t *btn_indentify;
+static lv_obj_t *btn_identify;
 static lv_obj_t *check_db_txt;
 static lv_display_rotation_t rotation = LV_DISP_ROTATION_0;
 int64_t button_start_time = 0; // Variable to hold the start time
 int64_t button_end_time = 0;   // Variable to hold the end time
 int64_t button_elapsed_time = 0;
+bool gpio_cklicked_flag = false;
+bool gpio_pressed_flag = false;
+bool gpio_long_press_release_flag = false;
+
+typedef enum
+{
+    MAIN_MENU,
+    SEARCHING_MENU,
+    REGISTER_MENU,
+    IDENTIFY_MENU
+} rbv_screen_t;
+
+typedef enum
+{
+    REG_BUTTON,
+    IDENTIFY_BUTTON
+} main_menu_btn_t;
 
 TaskHandle_t gpio_task_handle = NULL;
 TaskHandle_t lvgl_task_handle = NULL;
@@ -113,37 +133,39 @@ __attribute__((aligned(16))) float y_cf[FFT_SIZE * 2];
 // Pointers to result arrays
 float *y1_cf = &y_cf[0];
 
-static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *edata,
+                                    void *user_ctx)
 {
-    lv_display_t *disp = (lv_display_t *)user_ctx;
+    lv_display_t *disp = (lv_display_t *) user_ctx;
     lv_display_flush_ready(disp);
     return false;
 }
 
-/* Rotate display and touch, when rotated screen in LVGL. Called when driver parameters are updated. */
+/* Rotate display and touch, when rotated screen in LVGL. Called when driver
+ * parameters are updated. */
 static void lvgl_port_update_callback(lv_display_t *disp)
 {
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
     lv_display_rotation_t rotation = lv_display_get_rotation(disp);
     rotation = LV_DISPLAY_ROTATION_90;
-    switch (rotation)
-    {
-    case LV_DISPLAY_ROTATION_0:
+    switch (rotation) {
+    case LV_DISPLAY_ROTATION_0 :
         // Rotate LCD display
         esp_lcd_panel_swap_xy(panel_handle, false);
         esp_lcd_panel_mirror(panel_handle, true, false);
         break;
-    case LV_DISPLAY_ROTATION_90:
+    case LV_DISPLAY_ROTATION_90 :
         // Rotate LCD display
         esp_lcd_panel_swap_xy(panel_handle, true);
         esp_lcd_panel_mirror(panel_handle, true, true);
         break;
-    case LV_DISPLAY_ROTATION_180:
+    case LV_DISPLAY_ROTATION_180 :
         // Rotate LCD display
         esp_lcd_panel_swap_xy(panel_handle, false);
         esp_lcd_panel_mirror(panel_handle, false, true);
         break;
-    case LV_DISPLAY_ROTATION_270:
+    case LV_DISPLAY_ROTATION_270 :
         // Rotate LCD display
         esp_lcd_panel_swap_xy(panel_handle, true);
         esp_lcd_panel_mirror(panel_handle, false, false);
@@ -151,7 +173,8 @@ static void lvgl_port_update_callback(lv_display_t *disp)
     }
 }
 
-static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area,
+                          uint8_t *px_map)
 {
     lvgl_port_update_callback(disp);
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
@@ -160,9 +183,11 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     int offsety1 = area->y1;
     int offsety2 = area->y2;
     // because SPI LCD is big-endian, we need to swap the RGB bytes order
-    lv_draw_sw_rgb565_swap(px_map, (offsetx2 + 1 - offsetx1) * (offsety2 + 1 - offsety1));
+    lv_draw_sw_rgb565_swap(px_map, (offsetx2 + 1 - offsetx1) *
+                                       (offsety2 + 1 - offsety1));
     // copy a buffer's content to a specific area of the display
-    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
+    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1,
+                              offsety2 + 1, px_map);
 }
 
 static void increase_lvgl_tick(void *arg)
@@ -176,8 +201,7 @@ static void lvgl_port_task(void *arg)
     ESP_LOGI(TAG, "Starting LVGL task");
     uint32_t time_till_next_ms = 0;
     uint32_t time_threshold_ms = 1000 / CONFIG_FREERTOS_HZ;
-    while (1)
-    {
+    while (1) {
         _lock_acquire(&lvgl_api_lock);
         time_till_next_ms = lv_timer_handler();
         _lock_release(&lvgl_api_lock);
@@ -189,38 +213,56 @@ static void lvgl_port_task(void *arg)
 
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
-    uint32_t gpio_num = (uint32_t)arg;
+    uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
 
 static void gpio_get_level_task(void *arg)
 {
+    lv_style_value_t btn_reg_style;
+    lv_style_value_t btn_indentify_style;
     uint32_t io_num;
     bool gpio_high_level_flag = false;
-    for (;;)
-    {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
-        {
-            if (io_num == MAIN_BUTTON)
-            {
-                if (gpio_get_level(io_num) && gpio_high_level_flag == false)
-                {
+    for (;;) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            if (io_num == MAIN_BUTTON) {
+                if (gpio_get_level(io_num) && gpio_high_level_flag == false) {
                     gpio_high_level_flag = true;
-                    lv_obj_send_event(btn_register, LV_EVENT_CLICKED, display);
                     button_start_time = esp_timer_get_time();
-                    click_button_pos++;
-                }
-                else if (gpio_get_level(io_num) == 0 && gpio_high_level_flag == true)
-                {
+                } else if (gpio_get_level(io_num) == 0 &&
+                           gpio_high_level_flag == true) {
                     gpio_high_level_flag = false;
+                    gpio_pressed_flag = true;
+                    gpio_cklicked_flag = false;
+                    gpio_long_press_release_flag = false;
                     button_end_time = esp_timer_get_time();
-                    button_elapsed_time = button_start_time - button_end_time;
-                    if ((button_elapsed_time) / 1000 < 500)
-                    {
-                    }
-                    else if ((button_elapsed_time) / 1000 >= 1000)
-                    {
-                        // lv_obj_send_event(btn_register, LV_EVENT_LONG_PRESSED, display);
+                    button_elapsed_time = button_end_time - button_start_time;
+                    if (((button_elapsed_time) / 1000) < 500) {
+                        gpio_pressed_flag = false;
+                        gpio_cklicked_flag = true;
+                        gpio_long_press_release_flag = false;
+                    } else if (((button_elapsed_time) / 1000) >= 600) {
+                        gpio_pressed_flag = false;
+                        gpio_cklicked_flag = false;
+                        gpio_long_press_release_flag = true;
+                        // btn_reg_style = lv_obj_get_style_prop(
+                        //     btn_register, LV_PART_MAIN, LV_STYLE_BG_COLOR);
+                        // printf("Style bg register btn color: %ld\r\n",
+                        //        btn_reg_style.num);
+                        // btn_indentify_style = lv_obj_get_style_prop(
+                        //     btn_identify, LV_PART_MAIN, LV_STYLE_BG_COLOR);
+                        // printf("Style bg identify btn color: %ld\r\n",
+                        //        btn_indentify_style.num);
+
+                        // if (btn_reg_style.num == ORAGNE_COLOR) {
+                        //     lv_obj_send_event(btn_register,
+                        //                       LV_EVENT_LONG_PRESSED,
+                        //                       display);
+                        // } else {
+                        //     lv_obj_send_event(btn_identify,
+                        //                       LV_EVENT_LONG_PRESSED,
+                        //                       display);
+                        // }
                     }
                 }
             }
@@ -232,11 +274,12 @@ static void gpio_get_level_task(void *arg)
 void i2s_install()
 {
     const i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = I2S_SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .communication_format =
+            I2S_COMM_FORMAT_STAND_I2S | I2S_COMM_FORMAT_I2S_MSB,
         .intr_alloc_flags = ESP_INTR_FLAG_NMI,
         .dma_buf_count = 16,
         .dma_buf_len = I2S_BUFFER_SIZE * 4,
@@ -249,11 +292,10 @@ void i2s_install()
 
 void i2s_setpin()
 {
-    const i2s_pin_config_t pin_config = {
-        .bck_io_num = STD_BCLK_IO1,
-        .ws_io_num = STD_WS_IO1,
-        .data_out_num = -1,
-        .data_in_num = STD_DOUT_IO1};
+    const i2s_pin_config_t pin_config = {.bck_io_num = STD_BCLK_IO1,
+                                         .ws_io_num = STD_WS_IO1,
+                                         .data_out_num = -1,
+                                         .data_in_num = STD_DOUT_IO1};
 
     i2s_set_pin(I2S_PORT, &pin_config);
 }
@@ -265,22 +307,18 @@ void get_fft_peaks(float *y1_cf, float *fft_max_vals, int *fft_max_freq)
     fft_max_freq[0] = fft_max_freq[1] = fft_max_freq[2] = 0;
 
     // Process the FFT array
-    for (size_t i = 0; i < FFT_SIZE / 2; i++)
-    {
+    for (size_t i = 0; i < FFT_SIZE / 2; i++) {
         // Calculate the logarithmic value for the FFT
         y1_cf[i] = 10 * log10f((y1_cf[i * 2 + 0] * y1_cf[i * 2 + 0] +
                                 y1_cf[i * 2 + 1] * y1_cf[i * 2 + 1]) /
                                FFT_SIZE);
         printf("%.2f\r\n", y1_cf[i]);
         // Skip the first 64 and the last element
-        if (i > 64 && i < ((FFT_SIZE / 2) - 1))
-        {
+        if (i > 64 && i < ((FFT_SIZE / 2) - 1)) {
             // Check if it's a local maximum
-            if (y1_cf[i] > y1_cf[i - 1] && y1_cf[i] > y1_cf[i + 1])
-            {
+            if (y1_cf[i] > y1_cf[i - 1] && y1_cf[i] > y1_cf[i + 1]) {
                 // Compare with current top peaks
-                if (y1_cf[i] > fft_max_vals[0])
-                {
+                if (y1_cf[i] > fft_max_vals[0]) {
                     // Shift down the peaks
                     fft_max_vals[2] = fft_max_vals[1];
                     fft_max_freq[2] = fft_max_freq[1];
@@ -288,16 +326,12 @@ void get_fft_peaks(float *y1_cf, float *fft_max_vals, int *fft_max_freq)
                     fft_max_freq[1] = fft_max_freq[0];
                     fft_max_vals[0] = y1_cf[i];
                     fft_max_freq[0] = i;
-                }
-                else if (y1_cf[i] > fft_max_vals[1])
-                {
+                } else if (y1_cf[i] > fft_max_vals[1]) {
                     fft_max_vals[2] = fft_max_vals[1];
                     fft_max_freq[2] = fft_max_freq[1];
                     fft_max_vals[1] = y1_cf[i];
                     fft_max_freq[1] = i;
-                }
-                else if (y1_cf[i] > fft_max_vals[2])
-                {
+                } else if (y1_cf[i] > fft_max_vals[2]) {
                     fft_max_vals[2] = y1_cf[i];
                     fft_max_freq[2] = i;
                 }
@@ -323,7 +357,7 @@ void fft_calc(float *y_cf, float *fft_max_vals, int *fft_max_freq)
     get_fft_peaks(y_cf, fft_max_vals, fft_max_freq);
 }
 
-static void mic_read_task(void *args)
+static void rbv_task(void *args)
 {
     int pos = 0;
     uint32_t sample_count = 0;
@@ -335,101 +369,123 @@ static void mic_read_task(void *args)
     int fft_max_freq[3] = {0};
     int fft_max_freq_avg[3] = {0};
     esp_err_t ret;
-
+    rbv_screen_t rbv_screen = MAIN_MENU;
     ret = dsps_fft2r_init_fc32(NULL, 2 * FFT_SIZE);
-    if (ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Not possible to initialize FFT. Error = %i", ret);
         return;
     }
     // Generate Hann window
     dsps_wind_hann_f32(wind, FFT_SIZE);
 
-    while (1)
-    {
-        uint8_t j = 0;
-        while (gpio_get_level(MAIN_BUTTON))
-        {
-            if (sample_count == 0)
-            {
-                vTaskSuspend(lvgl_task_handle);
-                vTaskSuspend(gpio_task_handle);
-                i2s_start(I2S_PORT);
-                memset(i2s_buffer, 0, sizeof(i2s_buffer));
-                start_time = esp_timer_get_time(); // Get the start time in microseconds
-            }
-            size_t bytes_read = 0;
-            esp_err_t err = i2s_read(I2S_PORT, &buffer32, sizeof(buffer32), &bytes_read, pdMS_TO_TICKS(1001));
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Failed to read I2S data. Error = %i", err);
-                break;
-            }
-            // Read I2S data buffer
-            int16_t samples_read = bytes_read / 4;
-            for (size_t i = 0; i < samples_read; ++i)
-            {
-                uint8_t mid = buffer32[i * 4 + 2];
-                uint8_t msb = buffer32[i * 4 + 3];
-                uint16_t raw = (((uint32_t)msb) << 8) + ((uint32_t)mid);
-                memcpy(&i2s_buffer[i + (j * (I2S_BUFFER_16_TOTAL_SIZE))], &raw, sizeof(raw));
-            }
-
-            sample_count += samples_read;
-            j++;
-            printf("j = %d\r\n", j);
-            if (j >= 8)
-            {
-                break;
-            }
-        }
-        if (sample_count > 0)
-        {
-            end_time = esp_timer_get_time();      // Get the end time in microseconds
-            elapsed_time = end_time - start_time; // Calculate elapsed time in microseconds
-            ESP_LOGI(TAG, "Read %lu samples. Total elapsed time: %lld ms", sample_count, elapsed_time / 1000);
-            if (elapsed_time / 1000 >= 1800)
-            {
-                for (size_t j = 0; j < sample_count / FFT_SIZE; j++)
-                {
-                    for (size_t i = 0; i < FFT_SIZE; i++)
-                    {
-                        x1[i] = (float)(i2s_buffer[i + (j * FFT_SIZE)] * wind[i]);
-                        y1_cf[2 * i] = x1[i];
-                        y1_cf[2 * i + 1] = 0;
-                    }
-                    if (j > 0)
-                    {
-                        fft_calc(y_cf, fft_max_vals, fft_max_freq);
-                        fft_max_vals_avg[0] += fft_max_vals[0];
-                        fft_max_vals_avg[1] += fft_max_vals[1];
-                        fft_max_vals_avg[2] += fft_max_vals[2];
-                        fft_max_freq_avg[0] += fft_max_freq[0];
-                        fft_max_freq_avg[1] += fft_max_freq[1];
-                        fft_max_freq_avg[2] += fft_max_freq[2];
-                        printf("Max 1: %f at freq %d\n", fft_max_vals[0], (fft_max_freq[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                        printf("Max 2: %f at freq %d\n", fft_max_vals[1], (fft_max_freq[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                        printf("Max 3: %f at freq %d\n", fft_max_vals[2], (fft_max_freq[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                    }
+    while (1) {
+        switch (rbv_screen) {
+        case MAIN_MENU :
+            uint8_t j = 0;
+            if (gpio_cklicked_flag == true) {
+                gpio_cklicked_flag = false;
+                if (click_button_pos % 2 == 0) {
+                    lv_obj_send_event(btn_register, LV_EVENT_CLICKED, NULL);
+                } else {
+                    lv_obj_send_event(btn_identify, LV_EVENT_CLICKED, NULL);
                 }
-                uint8_t fft_iterarion = (sample_count / FFT_SIZE) - 1;
-                fft_max_vals_avg[0] = fft_max_vals_avg[0] / fft_iterarion;
-                fft_max_vals_avg[1] = fft_max_vals_avg[1] / fft_iterarion;
-                fft_max_vals_avg[2] = fft_max_vals_avg[2] / fft_iterarion;
-                fft_max_freq_avg[0] = fft_max_freq_avg[0] / fft_iterarion;
-                fft_max_freq_avg[1] = fft_max_freq_avg[1] / fft_iterarion;
-                fft_max_freq_avg[2] = fft_max_freq_avg[2] / fft_iterarion;
-
-                printf("Max avg 1: %f at freq %d\n", fft_max_vals_avg[0], (fft_max_freq_avg[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                printf("Max avg 2: %f at freq %d\n", fft_max_vals_avg[1], (fft_max_freq_avg[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
-                printf("Max avg 3: %f at freq %d\n", fft_max_vals_avg[2], (fft_max_freq_avg[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
+                click_button_pos++;
             }
-            vTaskResume(gpio_task_handle);
-            vTaskResume(lvgl_task_handle);
-            i2s_stop(I2S_PORT);
-            sample_count = 0; // Reset sample count
+            break;
+
+        default :
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // while (gpio_pressed_flag == true) {
+        //     if (sample_count == 0) {
+        //         vTaskSuspend(lvgl_task_handle);
+        //         i2s_start(I2S_PORT);
+        //         memset(i2s_buffer, 0, sizeof(i2s_buffer));
+        //         start_time =
+        //             esp_timer_get_time(); // Get the start time in
+        //             microseconds
+        //     }
+        //     size_t bytes_read = 0;
+        //     esp_err_t err = i2s_read(I2S_PORT, &buffer32, sizeof(buffer32),
+        //                              &bytes_read, pdMS_TO_TICKS(1001));
+        //     if (err != ESP_OK) {
+        //         ESP_LOGE(TAG, "Failed to read I2S data. Error = %i", err);
+        //         break;
+        //     }
+        //     // Read I2S data buffer
+        //     int16_t samples_read = bytes_read / 4;
+        //     for (size_t i = 0; i < samples_read; ++i) {
+        //         uint8_t mid = buffer32[i * 4 + 2];
+        //         uint8_t msb = buffer32[i * 4 + 3];
+        //         uint16_t raw = (((uint32_t) msb) << 8) + ((uint32_t) mid);
+        //         memcpy(&i2s_buffer[i + (j * (I2S_BUFFER_16_TOTAL_SIZE))],
+        //         &raw,
+        //                sizeof(raw));
+        //     }
+
+        //     sample_count += samples_read;
+        //     j++;
+        //     printf("j = %d\r\n", j);
+        //     if (j >= 8) {
+        //         break;
+        //     }
+        // }
+        // if (sample_count > 0) {
+        //     end_time = esp_timer_get_time(); // Get the end time in
+        //     microseconds elapsed_time =
+        //         end_time - start_time; // Calculate elapsed time in
+        //         microseconds
+        //     ESP_LOGI(TAG, "Read %lu samples. Total elapsed time: %lld ms",
+        //              sample_count, elapsed_time / 1000);
+        //     if (elapsed_time / 1000 >= 1800) {
+        //         for (size_t j = 0; j < sample_count / FFT_SIZE; j++) {
+        //             for (size_t i = 0; i < FFT_SIZE; i++) {
+        //                 x1[i] =
+        //                     (float) (i2s_buffer[i + (j * FFT_SIZE)] *
+        //                     wind[i]);
+        //                 y1_cf[2 * i] = x1[i];
+        //                 y1_cf[2 * i + 1] = 0;
+        //             }
+        //             if (j > 0) {
+        //                 fft_calc(y_cf, fft_max_vals, fft_max_freq);
+        //                 fft_max_vals_avg[0] += fft_max_vals[0];
+        //                 fft_max_vals_avg[1] += fft_max_vals[1];
+        //                 fft_max_vals_avg[2] += fft_max_vals[2];
+        //                 fft_max_freq_avg[0] += fft_max_freq[0];
+        //                 fft_max_freq_avg[1] += fft_max_freq[1];
+        //                 fft_max_freq_avg[2] += fft_max_freq[2];
+        //                 printf("Max 1: %f at freq %d\n", fft_max_vals[0],
+        //                        (fft_max_freq[0] * I2S_SAMPLE_RATE) /
+        //                        FFT_SIZE);
+        //                 printf("Max 2: %f at freq %d\n", fft_max_vals[1],
+        //                        (fft_max_freq[1] * I2S_SAMPLE_RATE) /
+        //                        FFT_SIZE);
+        //                 printf("Max 3: %f at freq %d\n", fft_max_vals[2],
+        //                        (fft_max_freq[2] * I2S_SAMPLE_RATE) /
+        //                        FFT_SIZE);
+        //             }
+        //         }
+        //         uint8_t fft_iterarion = (sample_count / FFT_SIZE) - 1;
+        //         fft_max_vals_avg[0] = fft_max_vals_avg[0] / fft_iterarion;
+        //         fft_max_vals_avg[1] = fft_max_vals_avg[1] / fft_iterarion;
+        //         fft_max_vals_avg[2] = fft_max_vals_avg[2] / fft_iterarion;
+        //         fft_max_freq_avg[0] = fft_max_freq_avg[0] / fft_iterarion;
+        //         fft_max_freq_avg[1] = fft_max_freq_avg[1] / fft_iterarion;
+        //         fft_max_freq_avg[2] = fft_max_freq_avg[2] / fft_iterarion;
+
+        //         printf("Max avg 1: %f at freq %d\n", fft_max_vals_avg[0],
+        //                (fft_max_freq_avg[0] * I2S_SAMPLE_RATE) / FFT_SIZE);
+        //         printf("Max avg 2: %f at freq %d\n", fft_max_vals_avg[1],
+        //                (fft_max_freq_avg[1] * I2S_SAMPLE_RATE) / FFT_SIZE);
+        //         printf("Max avg 3: %f at freq %d\n", fft_max_vals_avg[2],
+        //                (fft_max_freq_avg[2] * I2S_SAMPLE_RATE) / FFT_SIZE);
+        //     }
+        //     vTaskResume(lvgl_task_handle);
+        //     i2s_stop(I2S_PORT);
+        //     sample_count = 0; // Reset sample count
+        // }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     vTaskDelete(NULL);
 }
@@ -446,7 +502,7 @@ void gpio_config_pin(void)
     gpio_config(&io_conf);
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(MAIN_BUTTON, gpio_isr_handler, (void *)MAIN_BUTTON);
+    gpio_isr_handler_add(MAIN_BUTTON, gpio_isr_handler, (void *) MAIN_BUTTON);
 }
 
 void spi_configuration()
@@ -473,7 +529,8 @@ void spi_configuration()
         .trans_queue_depth = 10,
     };
     // Attach the LCD to the SPI bus
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle)); /*  */
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
+        (esp_lcd_spi_bus_handle_t) LCD_HOST, &io_config, &io_handle)); /*  */
 }
 
 void display_config()
@@ -484,7 +541,8 @@ void display_config()
         .bits_per_pixel = 16,
     };
     ESP_LOGI(TAG, "Install GC9A01 panel driver");
-    ESP_ERROR_CHECK(esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
+    ESP_ERROR_CHECK(
+        esp_lcd_new_panel_gc9a01(io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
@@ -501,16 +559,18 @@ void initialize_lvgl()
     display = lv_display_create(LCD_H_RES, LCD_V_RES);
 
     // Allocate buffers for LVGL
-    size_t draw_buffer_sz = LCD_H_RES * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t);
+    size_t draw_buffer_sz =
+        LCD_H_RES * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t);
     void *buf1 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
     assert(buf1);
     void *buf2 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
     assert(buf2);
 
     // Initialize LVGL draw buffers
-    lv_display_set_buffers(display, buf1, buf2, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(display, buf1, buf2, draw_buffer_sz,
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    // Associate the MIPI panel handle with the display
+    // Associate the SPI panel handle with the display
     lv_display_set_user_data(display, panel_handle);
 
     // Set color depth and format
@@ -523,44 +583,48 @@ void initialize_lvgl()
 
     // Tick interface for LVGL using esp_timer
     const esp_timer_create_args_t lvgl_tick_timer_args = {
-        .callback = &increase_lvgl_tick,
-        .name = "lvgl_tick"};
+        .callback = &increase_lvgl_tick, .name = "lvgl_tick"};
     esp_timer_handle_t lvgl_tick_timer = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
+    ESP_ERROR_CHECK(
+        esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
 
-    ESP_LOGI(TAG, "Register io panel event callback for LVGL flush ready notification");
+    ESP_LOGI(
+        TAG,
+        "Register io panel event callback for LVGL flush ready notification");
 
     // Register callback for flush ready notification
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = notify_lvgl_flush_ready,
     };
-    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, display));
+    ESP_ERROR_CHECK(
+        esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, display));
 }
 
-static void btn_cb(lv_event_t *e)
+static void reg_btn_cb(lv_event_t *e)
 {
-    if (click_button_pos % 2)
-    {
-        lv_obj_set_style_bg_color(btn_register, lv_color_hex(0xFFA500), LV_PART_MAIN);
-        lv_obj_set_style_bg_color(btn_indentify, lv_color_hex(0x0000FF), LV_PART_MAIN);
-    }
-    else
-    {
-        lv_obj_set_style_bg_color(btn_register, lv_color_hex(0x0000FF), LV_PART_MAIN);
-        lv_obj_set_style_bg_color(btn_indentify, lv_color_hex(0xFFA500), LV_PART_MAIN);
-    }
+    lv_obj_set_style_bg_color(btn_register, lv_color_hex(ORAGNE_COLOR),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_identify, lv_color_hex(BLUE_COLOR),
+                              LV_PART_MAIN);
+}
+
+static void id_btn_cb(lv_event_t *e)
+{
+    lv_obj_set_style_bg_color(btn_register, lv_color_hex(BLUE_COLOR),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_identify, lv_color_hex(ORAGNE_COLOR),
+                              LV_PART_MAIN);
 }
 
 void lvgl_ui_db_menu(lv_display_t *disp)
 {
-    ESP_LOGI(TAG, "Creating a new screen");
     // Create a new screen
     lv_obj_t *db_scr = lv_obj_create(NULL);
 
     // Add a title label to the new screen
     lv_obj_t *lbl_title = lv_label_create(db_scr);
-    lv_label_set_text(lbl_title, LV_SYMBOL_DOWNLOAD "CONSULTANDO DB");
+    lv_label_set_text(lbl_title, LV_SYMBOL_DOWNLOAD " CONSULTANDO DB");
     lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
 
     lv_disp_load_scr(db_scr);
@@ -568,7 +632,7 @@ void lvgl_ui_db_menu(lv_display_t *disp)
 
 static void btn_cb_long_press(lv_event_t *e)
 {
-    lv_display_t *disp = (lv_display_t *)lv_event_get_user_data(e);
+    lv_display_t *disp = (lv_display_t *) lv_event_get_user_data(e);
     // Switch to the new page
     lvgl_ui_db_menu(disp);
 }
@@ -576,19 +640,28 @@ static void btn_cb_long_press(lv_event_t *e)
 void lvgl_ui_main_menu(lv_display_t *disp)
 {
     lv_obj_t *scr = lv_display_get_screen_active(disp);
-
+    main_menu_btn_t main_menu_btn;
     btn_register = lv_button_create(scr);
     lv_obj_t *lbl_register = lv_label_create(btn_register);
+    lv_obj_set_style_bg_color(btn_register, lv_color_hex(BLUE_COLOR),
+                              LV_PART_MAIN);
     lv_label_set_text_static(lbl_register, LV_SYMBOL_UPLOAD " CADASTRAR");
     lv_obj_align(btn_register, LV_ALIGN_TOP_MID, 0, 60);
     /*Button event*/
-    lv_obj_add_event_cb(btn_register, btn_cb, LV_EVENT_CLICKED, disp);
-    lv_obj_add_event_cb(btn_register, btn_cb_long_press, LV_EVENT_LONG_PRESSED, disp);
+    lv_obj_add_event_cb(btn_register, reg_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn_register, btn_cb_long_press, LV_EVENT_LONG_PRESSED,
+                        disp);
 
-    btn_indentify = lv_button_create(scr);
-    lv_obj_t *lbl_identify = lv_label_create(btn_indentify);
+    btn_identify = lv_button_create(scr);
+    lv_obj_t *lbl_identify = lv_label_create(btn_identify);
+    lv_obj_set_style_bg_color(btn_identify, lv_color_hex(BLUE_COLOR),
+                              LV_PART_MAIN);
     lv_label_set_text_static(lbl_identify, LV_SYMBOL_DOWNLOAD " IDENTIFICAR");
-    lv_obj_align(btn_indentify, LV_ALIGN_BOTTOM_MID, 0, -60);
+    lv_obj_align(btn_identify, LV_ALIGN_BOTTOM_MID, 0, -60);
+    lv_obj_add_event_cb(btn_identify, id_btn_cb, LV_EVENT_CLICKED,
+                        &main_menu_btn);
+    lv_obj_add_event_cb(btn_identify, btn_cb_long_press, LV_EVENT_LONG_PRESSED,
+                        disp);
 }
 
 void app_main(void)
@@ -601,15 +674,16 @@ void app_main(void)
     initialize_lvgl();
 
     ESP_LOGI(TAG, "Create GPIO task");
-    xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10, &gpio_task_handle);
+    xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10,
+                &gpio_task_handle);
     ESP_LOGI(TAG, "Create LVGL task");
-    xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, &lvgl_task_handle);
+    xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL,
+                LVGL_TASK_PRIORITY, &lvgl_task_handle);
 
-    ESP_LOGI(TAG, "Display LVGL Meter Widget");
     // Lock the mutex due to the LVGL APIs are not thread-safe
     _lock_acquire(&lvgl_api_lock);
     lvgl_ui_main_menu(display);
     _lock_release(&lvgl_api_lock);
     vTaskDelay(pdMS_TO_TICKS(500));
-    xTaskCreate(mic_read_task, "mic_read_task", 4096, NULL, 5, &i2s_mic_task_handle);
+    xTaskCreate(rbv_task, "rbv_task", 4096, NULL, 5, &i2s_mic_task_handle);
 }

@@ -1,0 +1,25 @@
+AlignAfterOpenBracket: Align
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 2
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterControlStatement: Never
+  AfterEnum: true
+  AfterFunction: true
+  AfterStruct: false
+  BeforeElse: false
+  BeforeWhile: false
+  SplitEmptyFunction: false
+BreakBeforeTernaryOperators: true
+BreakStringLiterals: true
+ColumnLimit: 80
+IndentCaseLabels: false
+IndentWidth: 4
+ReflowComments: true
+SpaceAfterCStyleCast: true
+SpaceAfterLogicalNot: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCaseColon: true
