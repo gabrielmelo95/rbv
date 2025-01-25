@@ -27,40 +27,60 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "sdmmc_cmd.h"
 #include "soc/gpio_struct.h"
 
+#include "secrets.h"
+
 const char *TAG = "[MAIN]";
 
 /* I2S defs */
-#define STD_BCLK_IO1 GPIO_NUM_0 // I2S bit clock io number
-#define STD_WS_IO1 GPIO_NUM_1   // I2S word select io number
-#define STD_DOUT_IO1 GPIO_NUM_2 // I2S data out io number
+#ifdef CONFIG_IDF_TARGET_ESP32C6
+    #define STD_BCLK_IO1 GPIO_NUM_0 // I2S bit clock io number
+    #define STD_WS_IO1 GPIO_NUM_1   // I2S word select io number
+    #define STD_DOUT_IO1 GPIO_NUM_2 // I2S data out io number
+    #define MAIN_BUTTON GPIO_NUM_21
+    #define PIN_NUM_SCLK GPIO_NUM_17
+    #define PIN_NUM_MOSI GPIO_NUM_16
+    #define PIN_NUM_LCD_DC GPIO_NUM_23
+    #define PIN_NUM_LCD_RST GPIO_NUM_22
+    #define PIN_NUM_LCD_CS GPIO_NUM_19
+#endif
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    #define STD_BCLK_IO1 GPIO_NUM_1 // I2S bit clock io number
+    #define STD_WS_IO1 GPIO_NUM_2   // I2S word select io number
+    #define STD_DOUT_IO1 GPIO_NUM_3 // I2S data out io number
+    #define MAIN_BUTTON GPIO_NUM_4
+    #define PIN_NUM_SCLK GPIO_NUM_44
+    #define PIN_NUM_MOSI GPIO_NUM_43
+    #define PIN_NUM_LCD_DC GPIO_NUM_6
+    #define PIN_NUM_LCD_RST GPIO_NUM_5
+    #define PIN_NUM_LCD_CS GPIO_NUM_7
+#endif
+
 #define I2S_PORT I2S_NUM_0
 #define I2S_SAMPLE_RATE 8192
 #define I2S_BUFFER_SIZE 256
 #define FFT_SIZE (CONFIG_DSP_MAX_FFT_SIZE >> 1)
-#define MAIN_BUTTON GPIO_NUM_21
-#define GPIO_INPUT_PIN_SEL (1ULL << GPIO_NUM_21)
+#define GPIO_INPUT_PIN_SEL (1ULL << MAIN_BUTTON)
 #define I2S_BUFFER_32_TOTAL_SIZE I2S_SAMPLE_RATE
 #define I2S_BUFFER_16_TOTAL_SIZE (I2S_SAMPLE_RATE >> 2)
 #define I2S_TWO_PERIOD_BUFFER_SIZE (I2S_SAMPLE_RATE << 1)
 
 /* SPI config*/
 #define LCD_HOST SPI2_HOST
-#define PIN_NUM_SCLK GPIO_NUM_17
-#define PIN_NUM_MOSI GPIO_NUM_16
 #define PIN_NUM_MISO -1
-#define PIN_NUM_LCD_DC GPIO_NUM_23
-#define PIN_NUM_LCD_RST GPIO_NUM_22
-#define PIN_NUM_LCD_CS GPIO_NUM_19
 #define PIN_NUM_BK_LIGHT -1
 #define PIN_NUM_TOUCH_CS -1
 
@@ -83,6 +103,18 @@ const char *TAG = "[MAIN]";
 
 #define BLUE_COLOR 0x0000FF
 #define ORAGNE_COLOR 0xFFA500
+
+/* STA Configuration */
+#define ESP_WIFI_STA_SSID WIFI_SSID
+#define ESP_WIFI_STA_PASSWD WIFI_PASSWORD
+#define ESP_MAXIMUM_RETRY 10
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+
+static const char *TAG_STA = "WiFi Sta";
+
+static int s_retry_num = 0;
+static EventGroupHandle_t s_wifi_event_group;
 
 // LVGL library is not thread-safe, this example will call LVGL APIs from
 // different tasks, so use a mutex to protect it
@@ -135,6 +167,61 @@ __attribute__((aligned(16))) float wind[FFT_SIZE];
 __attribute__((aligned(16))) float y_cf[FFT_SIZE * 2];
 // Pointers to result arrays
 float *y1_cf = &y_cf[0];
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event =
+            (wifi_event_ap_staconnected_t *) event_data;
+        ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d", MAC2STR(event->mac),
+                 event->aid);
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *event =
+            (wifi_event_ap_stadisconnected_t *) event_data;
+        ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d, reason:%d",
+                 MAC2STR(event->mac), event->aid, event->reason);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG_STA, "Station started");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        ESP_LOGI(TAG_STA, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+esp_netif_t *wifi_init_sta(void)
+{
+    esp_netif_t *esp_netif_sta = esp_netif_create_default_wifi_sta();
+
+    wifi_config_t wifi_sta_config = {
+        .sta =
+            {
+                .ssid = ESP_WIFI_STA_SSID,
+                .password = ESP_WIFI_STA_PASSWD,
+                .scan_method = WIFI_ALL_CHANNEL_SCAN,
+                .failure_retry_cnt = ESP_MAXIMUM_RETRY,
+                /* Authmode threshold resets to WPA2 as default if password
+                 * matches WPA2 standards (password len => 8). If you want to
+                 * connect the device to deprecated WEP/WPA networks, Please set
+                 * the threshold value to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and
+                 * set the password with length and format matching to
+                 * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+                 */
+                .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
+                .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+            },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+
+    ESP_LOGI(TAG_STA, "wifi_init_sta finished.");
+
+    return esp_netif_sta;
+}
 
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *edata,
@@ -672,7 +759,56 @@ void app_main(void)
     gpio_config_pin();
     spi_configuration();
     display_config();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+
+    s_wifi_event_group = xEventGroupCreate();
+
     initialize_lvgl();
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    ESP_LOGI(TAG_STA, "ESP_WIFI_MODE_STA");
+    esp_netif_t *esp_netif_sta = wifi_init_sta();
+
+    /* Start WiFi */
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE, portMAX_DELAY);
+
+    /* xEventGroupWaitBits() returns the bits before the call returned,
+     * hence we can test which event actually happened. */
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG_STA, "connected to ap SSID:%s password:%s",
+                 ESP_WIFI_STA_SSID, ESP_WIFI_STA_PASSWD);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG_STA, "Failed to connect to SSID:%s, password:%s",
+                 ESP_WIFI_STA_SSID, ESP_WIFI_STA_PASSWD);
+    } else {
+        ESP_LOGE(TAG_STA, "UNEXPECTED EVENT");
+        return;
+    }
+
+    /* Set sta as the default interface */
+    esp_netif_set_default_netif(esp_netif_sta);
 
     ESP_LOGI(TAG, "Create GPIO task");
     xTaskCreate(gpio_get_level_task, "gpio_get_level_task", 2048, NULL, 10,
